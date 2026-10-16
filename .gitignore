@@ -1,0 +1,8 @@
+*.exe
+*.exe.config
+*.dat
+*.bak
+*.log
+settings.json
+dist/
+qa/
