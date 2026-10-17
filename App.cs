@@ -20,6 +20,7 @@ namespace WorkBuddyDaily {
         [STAThread] public static void Main(string[] args) {
             try { SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch (EntryPointNotFoundException) { }
             if (args.Length == 2 && args[0] == "--self-test") { Tests.Run(args[1]); return; }
+            if (args.Length == 3 && args[0] == "--test-close") { Tests.CloseWorkBuddy(args[1], args[2]); return; }
             bool created;
             using (var mutex = new Mutex(true, "Local\\WorkBuddyDailyDesktop", out created)) {
                 if (!created) { Forms.MessageBox.Show("签到助手已在运行，请查看托盘图标。", "每日签到"); return; }
@@ -37,7 +38,7 @@ namespace WorkBuddyDaily {
         Account account;
         readonly Api api = new Api();
         readonly TextBox path = new TextBox(), time = new TextBox();
-        readonly CheckBox enabled = new CheckBox(), startup = new CheckBox();
+        readonly CheckBox enabled = new CheckBox(), startup = new CheckBox(), closeAfterCheckin = new CheckBox();
         readonly TextBlock result = new TextBlock(), detail = new TextBlock(), accountText = new TextBlock(), next = new TextBlock();
         readonly TextBlock log = new TextBlock();
         readonly DispatcherTimer timer = new DispatcherTimer();
@@ -97,7 +98,9 @@ namespace WorkBuddyDaily {
             Box(path); path.Text = testing ? "" : prefs.ApplicationPath == "" ? FindWorkBuddy() : prefs.ApplicationPath; file.Children.Add(path); config.Children.Add(file);
             var switches = new StackPanel { Orientation = Orientation.Horizontal };
             enabled.Content = "每日自动签到"; enabled.IsChecked = prefs.Enabled; enabled.Margin = new Thickness(0, 0, 26, 0); switches.Children.Add(enabled);
-            startup.Content = "开机自动启动"; startup.IsChecked = prefs.Startup; switches.Children.Add(startup); config.Children.Add(switches); root.Children.Add(Card(config));
+            startup.Content = "开机自动启动"; startup.IsChecked = prefs.Startup; switches.Children.Add(startup); config.Children.Add(switches);
+            closeAfterCheckin.Content = "签到成功 10 秒后关闭 WorkBuddy"; closeAfterCheckin.IsChecked = prefs.CloseAfterCheckin; closeAfterCheckin.Margin = new Thickness(0, 12, 0, 0); config.Children.Add(closeAfterCheckin); root.Children.Add(Card(config));
+            closeAfterCheckin.ToolTip = "先关闭窗口；若仍驻留后台，将结束本次 WorkBuddy 进程。请勿在运行其他任务时开启。";
             var buttons = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 1, 0, 17) };
             buttons.Children.Add(Button("立即签到", delegate { Execute(false); }, true)); buttons.Children.Add(Button("保存设置", Save)); buttons.Children.Add(Button("打开 WorkBuddy", delegate { try { Launch(path.Text); } catch { SetResult("未能打开", "请检查 WorkBuddy 程序路径", true); } })); root.Children.Add(buttons);
             root.Children.Add(Text("最近运行", 12, Muted)); log.Margin = new Thickness(0, 6, 0, 0); log.FontSize = 11; log.Foreground = Muted; log.TextWrapping = TextWrapping.Wrap; root.Children.Add(log);
@@ -153,11 +156,12 @@ namespace WorkBuddyDaily {
                 if (enabled.IsChecked == true && account == null) throw new Exception("请先关联签到账号。");
                 SetStartup(startup.IsChecked == true);
                 prefs.Time = time.Text.Trim(); prefs.ApplicationPath = Path.GetFullPath(path.Text.Trim()); prefs.Enabled = enabled.IsChecked == true; prefs.Startup = startup.IsChecked == true;
+                prefs.CloseAfterCheckin = closeAfterCheckin.IsChecked == true;
                 store.Save(prefs); retryAt = DateTime.MinValue; retries = 0;
                 SetResult("设置已保存", prefs.Enabled ? "后台等待每日执行；关闭窗口会保留托盘" : "自动签到已关闭，可手动执行", false); UpdateNext();
             } catch (Exception ex) { SetResult("设置未保存", ex.Message, true); }
         }
-        void SetBusy(bool value) { busy = value; foreach (var button in actions) button.IsEnabled = !value; time.IsEnabled = path.IsEnabled = enabled.IsEnabled = startup.IsEnabled = !value; }
+        void SetBusy(bool value) { busy = value; foreach (var button in actions) button.IsEnabled = !value; time.IsEnabled = path.IsEnabled = enabled.IsEnabled = startup.IsEnabled = closeAfterCheckin.IsEnabled = !value; }
         void SetResult(string title, string message, bool error) {
             result.Text = title; result.Foreground = error ? Color("#A65E12") : Ink; detail.Text = message;
             if (tray != null) tray.Text = ("WorkBuddy · " + title).Substring(0, Math.Min(63, ("WorkBuddy · " + title).Length));
@@ -209,21 +213,41 @@ namespace WorkBuddyDaily {
             if (busy || exiting) return;
             if (automatic && (!prefs.Enabled || DateTime.UtcNow < Schedule.DueUtc(prefs, account, DateTime.UtcNow) || DateTime.UtcNow < retryAt)) { UpdateNext(); return; }
             if (account == null) { SetResult("尚未关联账号", "请先点击关联账号", true); return; }
-            if (Schedule.Done(prefs, account, DateTime.UtcNow)) { SetResult("今日已完成", "同一账号每天只执行一次", false); UpdateNext(); return; }
+            if (Schedule.Done(prefs, account, DateTime.UtcNow)) {
+                SetResult("今日已完成", "同一账号每天只执行一次", false);
+                if (!automatic && prefs.CloseAfterCheckin) {
+                    SetBusy(true); timer.Stop();
+                    try { await CloseWorkBuddyAfterDelay(prefs.ApplicationPath == "" ? path.Text.Trim() : prefs.ApplicationPath); }
+                    finally { SetBusy(false); UpdateNext(); }
+                } else UpdateNext();
+                return;
+            }
             SetBusy(true); timer.Stop();
             try {
-                Launch(prefs.ApplicationPath == "" ? path.Text.Trim() : prefs.ApplicationPath);
+                string application = Path.GetFullPath(prefs.ApplicationPath == "" ? path.Text.Trim() : prefs.ApplicationPath);
+                Launch(application);
                 SetResult("正在签到", "已启动 WorkBuddy，等待签到服务确认", false);
                 string day = Schedule.Day(DateTime.UtcNow);
                 string message = await api.Checkin(account, store, lifetime.Token);
                 prefs.LastAccount = account.Identity; prefs.LastDay = day; store.Save(prefs);
                 retries = 0; retryAt = DateTime.MinValue; SetResult("今日已完成", message, false); Record(message);
+                if (prefs.CloseAfterCheckin) await CloseWorkBuddyAfterDelay(application);
             } catch (ServiceException ex) {
                 if (ex.Auth) { prefs.Enabled = false; enabled.IsChecked = false; store.Save(prefs); SetResult("需要重新关联", "登录状态已失效，自动执行已暂停", true); Record("登录状态失效，自动执行暂停"); }
                 else Failed();
             } catch (OperationCanceledException) { }
             catch { Failed(); }
             finally { SetBusy(false); UpdateNext(); }
+        }
+        async Task CloseWorkBuddyAfterDelay(string application) {
+            SetResult("今日已完成", "10 秒后关闭 WorkBuddy", false);
+            string message;
+            try { message = await WorkBuddyExit.AfterSuccess(application, lifetime.Token); }
+            catch (OperationCanceledException) { return; }
+            catch { message = "签到已完成；WorkBuddy 退出未确认，请手动检查"; }
+            if (!exiting) {
+                SetResult("今日已完成", message, false); Record(message);
+            }
         }
         void Failed() {
             string today = Schedule.Day(DateTime.UtcNow);

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Net;
@@ -11,9 +12,53 @@ using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 
 namespace WorkBuddyDaily {
+    public static class WorkBuddyExit {
+        static Dictionary<int, DateTime> Snapshot(string application) {
+            var targets = new Dictionary<int, DateTime>();
+            foreach (Process process in Process.GetProcessesByName("WorkBuddy")) using (process) {
+                try { if (String.Equals(process.MainModule.FileName, application, StringComparison.OrdinalIgnoreCase)) targets[process.Id] = process.StartTime; } catch { }
+            }
+            return targets;
+        }
+        static Process Match(int id, DateTime started, string application) {
+            Process process = null;
+            try {
+                process = Process.GetProcessById(id);
+                if (process.StartTime == started && String.Equals(process.MainModule.FileName, application, StringComparison.OrdinalIgnoreCase)) return process;
+            } catch { }
+            if (process != null) process.Dispose();
+            return null;
+        }
+        public static async Task<string> AfterSuccess(string application, CancellationToken ct) {
+            application = Path.GetFullPath(application);
+            if (!String.Equals(Path.GetFileName(application), "WorkBuddy.exe", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("请选择 WorkBuddy.exe。");
+            var targets = Snapshot(application);
+            await Task.Delay(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
+            bool pending = false;
+            foreach (var target in targets) using (Process process = Match(target.Key, target.Value, application)) {
+                if (process == null) continue;
+                pending = true;
+                try { if (process.MainWindowHandle != IntPtr.Zero) process.CloseMainWindow(); } catch { }
+            }
+            if (pending) await Task.Delay(TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
+            return await Task.Run(delegate {
+                bool failed = false;
+                foreach (var target in targets) {
+                    ct.ThrowIfCancellationRequested();
+                    using (Process process = Match(target.Key, target.Value, application)) {
+                        if (process == null) continue;
+                        try { process.Kill(); if (!process.WaitForExit(3000)) failed = true; }
+                        catch { if (!process.HasExited) failed = true; }
+                    }
+                }
+                foreach (var target in targets) using (Process process = Match(target.Key, target.Value, application)) { if (process != null) failed = true; }
+                return failed ? "签到已完成；WorkBuddy 仍在运行，请手动检查" : "签到已完成，WorkBuddy 已退出";
+            }, ct).ConfigureAwait(false);
+        }
+    }
     public sealed class Preferences {
         public string Time = "09:00", ApplicationPath = "", LastAccount = "", LastDay = "";
-        public bool Enabled = false, Startup = false;
+        public bool Enabled = false, Startup = false, CloseAfterCheckin = false;
     }
     public sealed class Account {
         public string AccessToken = "", RefreshToken = "", Uid = "", Enterprise = "", Nickname = "", Domain = "codebuddy.cn";

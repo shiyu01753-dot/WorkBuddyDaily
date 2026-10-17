@@ -8,13 +8,31 @@ using System.Windows;
 
 namespace WorkBuddyDaily {
     public static class Tests {
+        public static void CloseWorkBuddy(string application, string output) {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            try {
+                string result = WorkBuddyExit.AfterSuccess(application, CancellationToken.None).GetAwaiter().GetResult();
+                File.WriteAllText(output, result + Environment.NewLine + "ElapsedSeconds=" + clock.Elapsed.TotalSeconds.ToString("F1"), Encoding.UTF8);
+            } catch (Exception ex) { File.WriteAllText(output, "FAIL: " + ex.GetType().Name, Encoding.UTF8); }
+        }
         static void Check(bool condition, string message) { if (!condition) throw new Exception(message); }
         static Dictionary<string, object> Data(params object[] values) { var data = new Dictionary<string, object>(); for (int i = 0; i < values.Length; i += 2) data[(string)values[i]] = values[i + 1]; return data; }
         public static void Run(string output) {
             string temp = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(output)), "isolated-" + Guid.NewGuid().ToString("N"));
             try {
                 var store = new Store(temp);
-                var p = store.Load(); Check(!p.Enabled && !p.Startup, "Clean defaults");
+                var p = store.Load(); Check(!p.Enabled && !p.Startup && !p.CloseAfterCheckin, "Clean defaults");
+                p.CloseAfterCheckin = true; store.Save(p); Check(store.Load().CloseAfterCheckin, "Close after checkin preference round trip");
+                File.WriteAllText(Path.Combine(temp, "settings.json"), "{\"Time\":\"09:00\",\"Enabled\":false}");
+                Check(!store.Load().CloseAfterCheckin, "Existing settings keep auto-close disabled");
+                bool invalidExit = false;
+                try { WorkBuddyExit.AfterSuccess("unrelated.exe", CancellationToken.None).GetAwaiter().GetResult(); } catch (ArgumentException) { invalidExit = true; }
+                Check(invalidExit, "Never close an unrelated executable");
+                using (var canceled = new CancellationTokenSource()) {
+                    canceled.Cancel(); bool stopped = false;
+                    try { WorkBuddyExit.AfterSuccess(Path.Combine(temp, "WorkBuddy.exe"), canceled.Token).GetAwaiter().GetResult(); } catch (OperationCanceledException) { stopped = true; }
+                    Check(stopped, "Cancel shutdown before delay completes");
+                }
                 var a = new Account { AccessToken = "synthetic-access-token", RefreshToken = "synthetic-refresh-token", Uid = "synthetic-user" };
                 store.SaveAccount(a); Check(store.LoadAccount().AccessToken == a.AccessToken, "Encrypted account round trip");
                 Check(!Encoding.UTF8.GetString(File.ReadAllBytes(Path.Combine(temp, "account.dat"))).Contains(a.AccessToken), "No plaintext token");
